@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""oc-sync —— 在不开云服务器、不用厂商云同步的前提下，跨设备同步 OpenCode 聊天记录。
+"""oc-sync —— 跨设备同步 OpenCode 聊天记录（不需要安装 git）。
 
 原理：OpenCode 的会话是事件溯源（event 表为不可变事件，session/message/part 是投影）。
-本工具把本机新事件导出成加密增量包存进一个私有 git 仓库（存储转发），
-在其他机器上再通过 OpenCode 自带的 /sync/replay 接口灌回本机，由 app 自行重建投影。
+本工具把本机新事件导出成加密增量包，存进一个 GitHub 私有仓库（当加密文件柜用，
+直接走 GitHub HTTP API，不依赖 git），在其他机器上再通过 OpenCode 自带的
+/sync/replay 接口灌回本机，由 app 自行重建投影。
 
 命令：
-  python oc_sync.py init     首次配置（仓库地址 / 共享口令 / 机器名），并克隆仓库
-  python oc_sync.py pull     拉取仓库新事件并导入本机（OpenCode 需在运行）
-  python oc_sync.py push     导出本机新事件、加密、提交并推送到仓库
+  python oc_sync.py init     首次配置（GitHub 令牌 / 私有仓库 / 共享口令 / 机器名）
+  python oc_sync.py pull     拉取云端新事件并导入本机（OpenCode 需在运行）
+  python oc_sync.py push     导出本机新事件、加密、上传到 GitHub
   python oc_sync.py sync     先 pull 再 push
-  python oc_sync.py status   查看本机与仓库的事件进度
+  python oc_sync.py status   查看本机与云端的进度
 """
 
 import argparse
@@ -26,7 +27,6 @@ import sqlite3
 import subprocess
 import sys
 import urllib.error
-import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,12 +36,15 @@ HOME = Path(os.environ.get("USERPROFILE") or Path.home())
 CONFIG_DIR = Path(os.environ["OC_SYNC_CONFIG"]) if os.environ.get("OC_SYNC_CONFIG") else (HOME / ".config" / APP)
 CONFIG_FILE = CONFIG_DIR / "config.json"
 PASS_FILE = CONFIG_DIR / "passphrase"
-REPO_DIR = CONFIG_DIR / "repo"
-BUNDLE_DIR_NAME = "bundles"
+TOKEN_FILE = CONFIG_DIR / "token"
+BUNDLE_PREFIX = "bundles"
 DB_PATH = Path(os.environ["OC_SYNC_DB"]) if os.environ.get("OC_SYNC_DB") else (HOME / ".local" / "share" / "opencode" / "opencode.db")
 MAGIC = b"OCSB1"
 CHUNK = 500
+MAX_BUNDLE_BYTES = 20 * 1024 * 1024
+MAX_BUNDLE_EVENTS = 5000
 SCRYPT_N = 1 << 15
+API = "https://api.github.com"
 
 
 def die(msg, code=1):
@@ -86,7 +89,7 @@ def decrypt_bytes(blob: bytes, passphrase: bytes) -> bytes:
     return _aesgcm(key).decrypt(nonce, ct, None)
 
 
-# --------------------------------------------------------------- 本机 config --
+# --------------------------------------------------------------- config ------
 
 def load_config():
     if not CONFIG_FILE.exists():
@@ -100,106 +103,113 @@ def load_passphrase() -> bytes:
     return PASS_FILE.read_bytes()
 
 
+def load_token() -> str:
+    if not TOKEN_FILE.exists():
+        die("尚未设置 GitHub 令牌，请先运行：python oc_sync.py init")
+    return TOKEN_FILE.read_text(encoding="utf-8").strip()
+
+
 def save_config(cfg):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-# ------------------------------------------------------------------- git -----
+# --------------------------------------------------------- GitHub API --------
 
-def git(*args, check=True):
-    r = subprocess.run(
-        ["git"] + list(args), cwd=str(REPO_DIR),
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-    )
-    if check and r.returncode != 0:
-        die("git %s 失败：\n%s%s" % (" ".join(args), r.stdout, r.stderr))
-    return r
-
-
-def ensure_repo():
-    cfg = load_config()
-    repo = cfg["repo"]
-    if (REPO_DIR / ".git").exists():
-        git("remote", "set-url", "origin", repo)
-    else:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        r = subprocess.run(["git", "clone", repo, str(REPO_DIR)],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
-        if r.returncode != 0:
-            git("init")
-            git("remote", "add", "origin", repo)
-    git("config", "user.name", cfg.get("machine") or "oc-sync", check=False)
-    git("config", "user.email", (cfg.get("machine") or "oc-sync") + "@oc-sync.local", check=False)
-    git("config", "push.default", "current", check=False)
-    git("config", "pull.rebase", "true", check=False)
-    return cfg
+def gh(method, path, token, body=None):
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(API + path, data=data, method=method, headers={
+        "Authorization": "Bearer " + token,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "oc-sync",
+        "Content-Type": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            raw = resp.read()
+        return resp.status, (json.loads(raw.decode()) if raw else None)
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        try:
+            return e.code, json.loads(raw)
+        except Exception:
+            return e.code, raw
 
 
-def git_pull():
-    r = subprocess.run(
-        ["git", "pull", "--rebase", "--autostash"], cwd=str(REPO_DIR),
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-    )
-    if r.returncode != 0:
-        out = r.stdout + r.stderr
-        benign = ("couldn't find remote ref", "no commits yet", "no such ref was fetched")
-        if any(s in out for s in benign):
-            return
-        die("git pull 失败：\n%s" % out)
+def gh_login(token):
+    st, res = gh("GET", "/user", token)
+    if st != 200 or not isinstance(res, dict):
+        die("GitHub 令牌无效或网络不通（HTTP %s）" % st)
+    return res["login"]
 
 
-def git_commit_push(message):
-    git("add", "-A")
-    r = git("commit", "-m", message, check=False)
-    if r.returncode != 0 and "nothing to commit" not in (r.stdout + r.stderr):
-        die("git commit 失败：\n%s%s" % (r.stdout, r.stderr))
-    for _ in range(3):
-        r = git("push", "-u", "origin", "HEAD", check=False)
-        if r.returncode == 0:
-            return
-        git_pull()
-    die("git push 多次失败：\n%s%s" % (r.stdout, r.stderr))
+def gh_ensure_repo(token, owner, repo):
+    st, res = gh("GET", "/repos/%s/%s" % (owner, repo), token)
+    if st == 200:
+        return res.get("default_branch") or "main"
+    if st == 404:
+        st2, res2 = gh("POST", "/user/repos", token, {
+            "name": repo, "private": True, "auto_init": True,
+            "description": "oc-sync encrypted event bundles",
+        })
+        if st2 not in (200, 201):
+            die("创建仓库失败：HTTP %s %s" % (st2, res2))
+        return res2.get("default_branch") or "main"
+    die("访问仓库失败：HTTP %s %s" % (st, res))
 
 
-# ------------------------------------------------------------------ 包文件 ----
+def gh_list_bundles(token, owner, repo, branch):
+    st, res = gh("GET", "/repos/%s/%s/contents/%s?ref=%s" % (owner, repo, BUNDLE_PREFIX, branch), token)
+    if st == 404:
+        return []
+    if st != 200 or not isinstance(res, list):
+        die("列出远端失败：HTTP %s %s" % (st, res))
+    return [x for x in res if x.get("type") == "file"]
 
-def bundle_dir() -> Path:
-    return REPO_DIR / BUNDLE_DIR_NAME
 
+def gh_download(token, owner, repo, path):
+    st, res = gh("GET", "/repos/%s/%s/contents/%s" % (owner, repo, path), token)
+    if st != 200 or not isinstance(res, dict):
+        die("下载失败 %s：HTTP %s" % (path, st))
+    if res.get("content"):
+        return base64.b64decode(res["content"])
+    url = res.get("download_url")
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token, "User-Agent": "oc-sync"})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        return resp.read()
+
+
+def gh_upload(token, owner, repo, branch, path, blob, message):
+    body = {"message": message, "content": base64.b64encode(blob).decode("ascii"), "branch": branch}
+    st, res = gh("GET", "/repos/%s/%s/contents/%s?ref=%s" % (owner, repo, path, branch), token)
+    if st == 200 and isinstance(res, dict):
+        body["sha"] = res["sha"]
+    st, res = gh("PUT", "/repos/%s/%s/contents/%s" % (owner, repo, path), token, body)
+    if st not in (200, 201):
+        die("上传失败 %s：HTTP %s %s" % (path, st, res))
+
+
+# --------------------------------------------------------- 包文件命名 --------
 
 def bundle_name(stamp, machine, agg, minseq, maxseq) -> str:
     return "%s__%s__%s__%d__%d.jsonl.enc" % (stamp, machine, agg, minseq, maxseq)
 
 
 def parse_bundle_name(name):
-    m = re.match(r"^(\d{8}T\d{6}Z)__(.+)__(ses_[0-9A-Za-z]+)__(\d+)__(\d+)\.jsonl\.enc$", name)
+    m = re.match(r"^([0-9A-Za-z-]+)__(.+)__(ses_[0-9A-Za-z]+)__(\d+)__(\d+)\.jsonl\.enc$", name)
     if not m:
         return None
-    return {
-        "stamp": m.group(1), "machine": m.group(2), "agg": m.group(3),
-        "min": int(m.group(4)), "max": int(m.group(5)),
-    }
+    return {"stamp": m.group(1), "machine": m.group(2), "agg": m.group(3),
+            "min": int(m.group(4)), "max": int(m.group(5)), "name": name}
 
 
-def scan_bundles():
-    d = bundle_dir()
-    out = []
-    if not d.is_dir():
-        return out
-    for p in sorted(d.glob("*.jsonl.enc")):
-        meta = parse_bundle_name(p.name)
-        if meta:
-            meta["path"] = p
-            out.append(meta)
-    return out
-
-
-def repo_heads():
+def remote_heads(files):
     heads = {}
-    for b in scan_bundles():
-        if b["max"] > heads.get(b["agg"], -1):
-            heads[b["agg"]] = b["max"]
+    for f in files:
+        meta = parse_bundle_name(f["name"])
+        if meta and meta["max"] > heads.get(meta["agg"], -1):
+            heads[meta["agg"]] = meta["max"]
     return heads
 
 
@@ -208,8 +218,7 @@ def repo_heads():
 def db_connect_ro():
     if not DB_PATH.exists():
         die("找不到 OpenCode 数据库：%s" % DB_PATH)
-    uri = DB_PATH.as_uri() + "?mode=ro"
-    return sqlite3.connect(uri, uri=True)
+    return sqlite3.connect(DB_PATH.as_uri() + "?mode=ro", uri=True)
 
 
 def local_heads():
@@ -227,10 +236,8 @@ def read_events(agg, after_seq):
     con = db_connect_ro()
     try:
         rows = con.execute(
-            "select id, seq, type, data from event "
-            "where aggregate_id=? and seq>? order by seq",
-            (agg, after_seq),
-        ).fetchall()
+            "select id, seq, type, data from event where aggregate_id=? and seq>? order by seq",
+            (agg, after_seq)).fetchall()
     finally:
         con.close()
     return [{"id": i, "aggregateID": agg, "seq": int(s), "type": t, "data": json.loads(d)}
@@ -309,8 +316,7 @@ def _list_pids():
     needed = ctypes.c_ulong()
     if not psapi.EnumProcesses(arr, ctypes.sizeof(arr), ctypes.byref(needed)):
         return []
-    n = needed.value // ctypes.sizeof(ctypes.c_ulong)
-    return list(arr[:n])
+    return list(arr[:needed.value // ctypes.sizeof(ctypes.c_ulong)])
 
 
 def _port_for_pid(pid):
@@ -318,8 +324,7 @@ def _port_for_pid(pid):
                        encoding="utf-8", errors="replace")
     fallback = None
     for line in r.stdout.splitlines():
-        low = line.lower()
-        if "listening" not in low:
+        if "listening" not in line.lower():
             continue
         parts = line.split()
         if not parts or not parts[-1].isdigit() or int(parts[-1]) != pid:
@@ -345,9 +350,8 @@ def find_server():
         if pw:
             port = env.get("OPENCODE_SERVER_PORT")
             port = int(port) if port and str(port).isdigit() else _port_for_pid(pid)
-            if not port:
-                continue
-            return port, pw, env.get("OPENCODE_SERVER_USERNAME", "opencode")
+            if port:
+                return port, pw, env.get("OPENCODE_SERVER_USERNAME", "opencode")
     die("未找到 OpenCode 本地服务，请确认 OpenCode 桌面版正在运行")
 
 
@@ -369,44 +373,46 @@ class Api:
 # ------------------------------------------------------------------ 命令 -----
 
 def cmd_init(args):
-    if (CONFIG_FILE.exists() and not args.force):
+    if CONFIG_FILE.exists() and not args.force:
         info("已存在配置：%s（要重写请加 --force）" % CONFIG_FILE)
-    repo = args.repo or input("Codeberg 仓库地址（https://codeberg.org/你/oc-sync.git）：").strip()
+        return
+    token = os.environ.get("OC_SYNC_TOKEN") or args.token
+    if not token:
+        token = getpass.getpass("GitHub 令牌（fine-grained，需 Contents 读写；不会显示）：").strip()
+    if not token:
+        die("令牌不能为空")
+    owner = gh_login(token)
+    repo = args.repo or input("数据仓库名（默认 opencode-history-sync-data，不存在会自动建私有库）：").strip()
     if not repo:
-        die("仓库地址不能为空")
-    envpw = os.environ.get("OC_SYNC_PASSPHRASE")
-    if envpw:
-        pw1 = pw2 = envpw
-    else:
-        pw1 = getpass.getpass("设置共享口令（5 台机器一致，建议 20+ 字符）：")
-        pw2 = getpass.getpass("再输入一遍：")
-    if pw1 != pw2:
-        die("两次口令不一致")
-    if not pw1:
+        repo = "opencode-history-sync-data"
+    branch = gh_ensure_repo(token, owner, repo)
+    pw = os.environ.get("OC_SYNC_PASSPHRASE")
+    if not pw:
+        a = getpass.getpass("设置共享口令（多台机器一致，建议 20+ 字符）：")
+        b = getpass.getpass("再输入一遍：")
+        if a != b:
+            die("两次口令不一致")
+        pw = a
+    if not pw:
         die("口令不能为空")
     machine = (args.machine or input("本机名字（默认 %s）：" % socket.gethostname())).strip()
-    if not machine:
-        machine = socket.gethostname()
-    machine = re.sub(r"[^A-Za-z0-9_-]", "-", machine)
+    machine = re.sub(r"[^A-Za-z0-9_-]", "-", machine or socket.gethostname())
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    PASS_FILE.write_bytes(pw1.encode("utf-8"))
-    save_config({"repo": repo, "machine": machine})
-    ensure_repo()
-    git_pull()
-    info("初始化完成。机器名：%s" % machine)
-    info("下一步：在任意一台机器先 push 一次全量，其余机器 pull。")
+    TOKEN_FILE.write_text(token, encoding="utf-8")
+    PASS_FILE.write_bytes(pw.encode("utf-8"))
+    save_config({"owner": owner, "repo": repo, "branch": branch, "machine": machine})
+    info("初始化完成：%s/%s（分支 %s），机器名 %s" % (owner, repo, branch, machine))
+    info("下一步：任意一台先 push 一次全量，其余机器 pull。")
 
 
 def cmd_push(args):
-    ensure_repo()
-    git_pull()
-    heads = repo_heads()
+    cfg = load_config()
+    token, pw = load_token(), load_passphrase()
+    files = gh_list_bundles(token, cfg["owner"], cfg["repo"], cfg["branch"])
+    heads = remote_heads(files)
     local = local_heads()
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    machine = load_config()["machine"]
-    passphrase = load_passphrase()
-    bundle_dir().mkdir(parents=True, exist_ok=True)
-    total = 0
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + os.urandom(3).hex()
+    total = uploads = 0
     for agg, head in sorted(local.items()):
         after = heads.get(agg, -1)
         if head <= after:
@@ -414,59 +420,68 @@ def cmd_push(args):
         events = read_events(agg, after)
         if not events:
             continue
-        lines = bytearray()
+        buf = bytearray()
+        first_seq = events[0]["seq"]
+        last_seq = first_seq
         for ev in events:
-            lines += json.dumps(
-                {"id": ev["id"], "aggregateID": ev["aggregateID"], "seq": ev["seq"],
-                 "type": ev["type"], "data": ev["data"]},
-                ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
-        name = bundle_name(stamp, machine, agg, events[0]["seq"], events[-1]["seq"])
-        (bundle_dir() / name).write_bytes(encrypt_bytes(bytes(lines), passphrase))
+            line = json.dumps(ev, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+            buf += line
+            last_seq = ev["seq"]
+            if len(buf) >= MAX_BUNDLE_BYTES or (last_seq - first_seq + 1) >= MAX_BUNDLE_EVENTS:
+                name = bundle_name(stamp, cfg["machine"], agg, first_seq, last_seq)
+                gh_upload(token, cfg["owner"], cfg["repo"], cfg["branch"],
+                          "%s/%s" % (BUNDLE_PREFIX, name), encrypt_bytes(bytes(buf), pw),
+                          "sync %s: %s" % (cfg["machine"], name))
+                uploads += 1
+                buf = bytearray()
+                first_seq = None
+        if buf:
+            name = bundle_name(stamp, cfg["machine"], agg, first_seq, last_seq)
+            gh_upload(token, cfg["owner"], cfg["repo"], cfg["branch"],
+                      "%s/%s" % (BUNDLE_PREFIX, name), encrypt_bytes(bytes(buf), pw),
+                      "sync %s: %s" % (cfg["machine"], name))
+            uploads += 1
         total += len(events)
     if total == 0:
-        info("本机没有仓库缺少的新事件，无需推送。")
+        info("本机没有云端缺少的新事件，无需推送。")
         return
-    git_commit_push("sync %s %s: %d events" % (machine, stamp, total))
-    info("已推送 %d 条新事件（%s）。" % (total, stamp))
+    info("已上传 %d 条新事件（%d 个加密包）。" % (total, uploads))
 
 
-def _replay_run(api, agg, run, directory):
+def _replay_run(api, run, directory):
     for i in range(0, len(run), CHUNK):
-        chunk = run[i:i + CHUNK]
-        api.post("/sync/replay", {"directory": directory or "", "events": chunk})
+        api.post("/sync/replay", {"directory": directory or "", "events": run[i:i + CHUNK]})
 
 
 def cmd_pull(args):
-    ensure_repo()
-    git_pull()
+    cfg = load_config()
+    token, pw = load_token(), load_passphrase()
+    files = gh_list_bundles(token, cfg["owner"], cfg["repo"], cfg["branch"])
     local = local_heads()
-    needed = [b for b in scan_bundles() if b["max"] > local.get(b["agg"], -1)]
+    needed = []
+    for f in files:
+        meta = parse_bundle_name(f["name"])
+        if meta and meta["max"] > local.get(meta["agg"], -1):
+            meta["file"] = f
+            needed.append(meta)
     if not needed:
-        info("仓库里没有本机缺少的新事件。")
+        info("云端没有本机缺少的新事件。")
         return
-    passphrase = load_passphrase()
     by_agg = {}
-    for b in needed:
-        plain = decrypt_bytes(b["path"].read_bytes(), passphrase)
-        for line in plain.split(b"\n"):
-            if not line.strip():
-                continue
-            ev = json.loads(line.decode("utf-8"))
-            by_agg.setdefault(ev["aggregateID"], {})[ev["id"]] = ev
-    if not by_agg:
-        info("没有可导入的事件。")
-        return
-    port, pw, user = find_server()
-    api = Api(port, pw, user)
-    applied = 0
-    sessions = 0
+    for meta in needed:
+        blob = gh_download(token, cfg["owner"], cfg["repo"], "%s/%s" % (BUNDLE_PREFIX, meta["name"]))
+        for line in decrypt_bytes(blob, pw).split(b"\n"):
+            if line.strip():
+                ev = json.loads(line.decode("utf-8"))
+                by_agg.setdefault(ev["aggregateID"], {})[ev["id"]] = ev
+    port, spw, user = find_server()
+    api = Api(port, spw, user)
+    applied = sessions = 0
     for agg, evmap in by_agg.items():
-        head = local.get(agg, -1)
         byseq = {}
         for ev in evmap.values():
             byseq.setdefault(ev["seq"], ev)
-        run = []
-        expect = head + 1
+        run, expect = [], local.get(agg, -1) + 1
         while expect in byseq:
             run.append(byseq[expect])
             expect += 1
@@ -478,7 +493,7 @@ def cmd_pull(args):
             if d:
                 directory = d
                 break
-        _replay_run(api, agg, run, directory)
+        _replay_run(api, run, directory)
         applied += len(run)
         sessions += 1
     if applied == 0:
@@ -494,38 +509,33 @@ def cmd_sync(args):
 
 
 def cmd_status(args):
-    ensure_repo()
+    cfg = load_config()
+    token = load_token()
+    files = gh_list_bundles(token, cfg["owner"], cfg["repo"], cfg["branch"])
+    heads = remote_heads(files)
     local = local_heads()
-    heads = repo_heads()
-    aggs = sorted(set(local) | set(heads))
-    missing_local = 0
-    missing_repo = 0
-    for agg in aggs:
-        lh = local.get(agg, -1)
-        rh = heads.get(agg, -1)
-        if rh > lh:
-            missing_local += rh - lh
-        if lh > rh:
-            missing_repo += lh - rh
-    info("本机会话数：%d，仓库已收录会话数：%d" % (len(local), len(heads)))
-    info("待从仓库导入：%d 条事件" % missing_local)
-    info("待推送到仓库：%d 条事件" % missing_repo)
-    if not (REPO_DIR / ".git").exists():
-        info("（仓库未初始化）")
+    ml = mr = 0
+    for agg in set(local) | set(heads):
+        ml += max(0, heads.get(agg, -1) - local.get(agg, -1))
+        mr += max(0, local.get(agg, -1) - heads.get(agg, -1))
+    info("本机会话数：%d，云端已收录会话数：%d" % (len(local), len(heads)))
+    info("待从云端导入：%d 条事件" % ml)
+    info("待推送到云端：%d 条事件" % mr)
 
 
 def main():
     if os.name != "nt":
         die("当前只支持 Windows 桌面版 OpenCode")
-    p = argparse.ArgumentParser(prog="oc-sync", description="OpenCode 聊天记录跨设备同步（私有 git + 端到端加密）")
+    p = argparse.ArgumentParser(prog="oc-sync", description="OpenCode 聊天记录跨设备同步（GitHub 私有库 + 端到端加密，无需 git）")
     sub = p.add_subparsers(dest="cmd")
-    pi = sub.add_parser("init", help="首次配置并克隆仓库")
-    pi.add_argument("--repo", help="git 仓库地址")
+    pi = sub.add_parser("init", help="首次配置（令牌 / 仓库 / 口令）")
+    pi.add_argument("--token", help="GitHub 令牌（否则交互输入）")
+    pi.add_argument("--repo", help="数据仓库名")
     pi.add_argument("--machine", help="本机名字")
     pi.add_argument("--force", action="store_true", help="覆盖已有配置")
     pi.set_defaults(func=cmd_init)
-    sub.add_parser("push", help="导出本机新事件并推送").set_defaults(func=cmd_push)
-    sub.add_parser("pull", help="拉取并导入仓库新事件").set_defaults(func=cmd_pull)
+    sub.add_parser("push", help="导出本机新事件并上传").set_defaults(func=cmd_push)
+    sub.add_parser("pull", help="拉取并导入云端新事件").set_defaults(func=cmd_pull)
     sub.add_parser("sync", help="先 pull 再 push").set_defaults(func=cmd_sync)
     sub.add_parser("status", help="查看进度").set_defaults(func=cmd_status)
     args = p.parse_args()
